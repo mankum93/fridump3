@@ -1,7 +1,7 @@
 # fridump3
-Fridump is an open source memory dumping tool, primarily aimed to penetration testers and developers. Fridump is using the Frida framework to dump accessible memory addresses from any platform supported. It can be used from a Windows, Linux or Mac OS X system to dump the memory of an iOS, Android or Windows application.
+Fridump is an open source memory dumping tool, primarily aimed at penetration testers and developers. It uses the Frida framework to dump accessible memory addresses from any platform supported. It can be used from a Windows, Linux or macOS system to dump the memory of an iOS, Android or Windows application.
 
-This project is based on the following project: [https://github.com/Nightbringer21/fridump](https://github.com/Nightbringer21/fridump) and the pending PR concerning the python3 support (especially from [georgepetz](https://github.com/georgepetz) . Additionally I added the network support in addition to the USB support.
+This project is based on the following project: [https://github.com/Nightbringer21/fridump](https://github.com/Nightbringer21/fridump) and the pending PR concerning Python3 support (especially from [georgepetz](https://github.com/georgepetz)). Additionally, network support has been added in addition to USB support. The embedded Frida agent applies several anti anti-debugging tricks, sanitising `/proc` reads and common system calls so the tooling can operate undetected while exposing the same RPC interface for memory dumping.
 
 FYI: I will destroy this repo is the Fridump author will integrate the pending PR concerning Python3 support.
 
