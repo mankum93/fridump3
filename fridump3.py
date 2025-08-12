@@ -107,11 +107,203 @@ mem_access_viol = ""
 
 print("Starting Memory dump...")
 
+# Load the anti-anti-debugging agent
 def on_message(message, data):
     print("[on_message] message:", message, "data:", data)
 
 
-script = session.create_script("""'use strict';
+agent_source = r"""
+'use strict';
+
+const libc = "libc.so";
+const NR_PTRACE = (() => {
+  switch (Process.arch) {
+    case "arm64": return 117;
+    case "arm":   return 26;
+    case "x64":   return 101;
+    case "ia32":  return 26;
+    default:      return 117;
+  }
+})();
+
+setImmediate(() => {
+  hookPtrace();
+  hookSyscallPtrace();
+  hookPrctlDumpable();
+  scrubProcStatusTracerPid();
+  hideFridaFromProcMaps();
+  spoofBuildProps();
+  hookJavaDebugLies();
+});
+
+function hookPtrace() {
+  const p = Module.findExportByName(libc, "ptrace");
+  if (!p) return;
+  Interceptor.attach(p, {
+    onEnter(args) { this.req = args[0].toInt32(); },
+    onLeave(retval) { retval.replace(0); }
+  });
+}
+
+function hookSyscallPtrace() {
+  const p = Module.findExportByName(libc, "syscall");
+  if (!p) return;
+  Interceptor.attach(p, {
+    onEnter(args) { this.nr = args[0].toInt32(); },
+    onLeave(retval) { if (this.nr === NR_PTRACE) retval.replace(0); }
+  });
+}
+
+const PR_GET_DUMPABLE = 3;
+const PR_SET_DUMPABLE = 4;
+function hookPrctlDumpable() {
+  const p = Module.findExportByName(libc, "prctl");
+  if (!p) return;
+  Interceptor.attach(p, {
+    onEnter(args) { this.opt = args[0].toInt32(); },
+    onLeave(retval) {
+      if (this.opt === PR_GET_DUMPABLE) retval.replace(1);
+      else if (this.opt === PR_SET_DUMPABLE) retval.replace(0);
+    }
+  });
+}
+
+function scrubProcStatusTracerPid() {
+  const openat = Module.findExportByName(libc, "openat");
+  const open_  = Module.findExportByName(libc, "open");
+  const read   = Module.findExportByName(libc, "read");
+  const statusFDs = new Set();
+
+  function trackOpen(which, pathArgIndex) {
+    if (!which) return;
+    Interceptor.attach(which, {
+      onEnter(args) {
+        this.path = null;
+        try { this.path = args[pathArgIndex].readUtf8String(); } catch (_) {}
+      },
+      onLeave(retval) {
+        const fd = retval.toInt32();
+        if (fd >= 0 && this.path && this.path.indexOf("/proc/self/status") !== -1) {
+          statusFDs.add(fd);
+        }
+      }
+    });
+  }
+
+  trackOpen(openat, 1);
+  trackOpen(open_, 0);
+
+  if (read) {
+    Interceptor.attach(read, {
+      onEnter(args) {
+        this.fd  = args[0].toInt32();
+        this.buf = args[1];
+        this.len = args[2].toInt32();
+      },
+      onLeave(retval) {
+        try {
+          if (retval.toInt32() > 0 && statusFDs.has(this.fd)) {
+            const s = this.buf.readUtf8String(retval.toInt32());
+            if (s && s.indexOf("TracerPid:") !== -1) {
+              const fixed = s.replace(/TracerPid:\s*\d+/, "TracerPid:\t0");
+              Memory.writeUtf8String(this.buf, fixed);
+              retval.replace(fixed.length);
+            }
+          }
+        } catch (_) {}
+      }
+    });
+  }
+}
+
+function hideFridaFromProcMaps() {
+  const openat = Module.findExportByName(libc, "openat");
+  const open_  = Module.findExportByName(libc, "open");
+  const read   = Module.findExportByName(libc, "read");
+  const mapsFDs = new Set();
+  const BAD = [/frida/i, /gadget/i, /gum[-_.]/i, /frida-agent/i];
+
+  function trackOpen(which, pathArgIndex) {
+    if (!which) return;
+    Interceptor.attach(which, {
+      onEnter(args) {
+        this.path = null;
+        try { this.path = args[pathArgIndex].readUtf8String(); } catch (_) {}
+      },
+      onLeave(retval) {
+        const fd = retval.toInt32();
+        if (fd >= 0 && this.path && this.path.indexOf("/proc/self/maps") !== -1) {
+          mapsFDs.add(fd);
+        }
+      }
+    });
+  }
+
+  trackOpen(openat, 1);
+  trackOpen(open_, 0);
+
+  if (read) {
+    Interceptor.attach(read, {
+      onEnter(args) {
+        this.fd  = args[0].toInt32();
+        this.buf = args[1];
+        this.len = args[2].toInt32();
+      },
+      onLeave(retval) {
+        try {
+          if (retval.toInt32() > 0 && mapsFDs.has(this.fd)) {
+            const s = this.buf.readUtf8String(retval.toInt32());
+            if (s) {
+              const cleaned = s.split("\n").filter(line => !BAD.some(rx => rx.test(line))).join("\n");
+              if (cleaned.length !== s.length) {
+                Memory.writeUtf8String(this.buf, cleaned);
+                retval.replace(cleaned.length);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+    });
+  }
+}
+
+function spoofBuildProps() {
+  const propGet = Module.findExportByName(libc, "__system_property_get");
+  if (!propGet) return;
+  Interceptor.attach(propGet, {
+    onEnter(args) {
+      this.name = args[0].readUtf8String();
+      this.buf  = args[1];
+    },
+    onLeave(retval) {
+      try {
+        if (this.name === "ro.debuggable") {
+          Memory.writeUtf8String(this.buf, "0");
+          retval.replace(1);
+        } else if (this.name === "ro.secure") {
+          Memory.writeUtf8String(this.buf, "1");
+          retval.replace(1);
+        }
+      } catch (_) {}
+    }
+  });
+}
+
+function hookJavaDebugLies() {
+  if (!Java.available) return;
+  Java.perform(() => {
+    try {
+      const Debug = Java.use("android.os.Debug");
+      Debug.isDebuggerConnected.implementation = () => false;
+      Debug.waitingForDebugger.implementation  = () => false;
+    } catch (_) {}
+    try {
+      const VmDebug = Java.use("dalvik.system.VMDebug");
+      VmDebug.isDebuggerConnected.implementation = () => false;
+      VmDebug.debuggerConnected.implementation   = () => false;
+    } catch (_) {}
+  });
+}
 
 rpc.exports = {
   enumerateRanges: function (prot) {
@@ -121,7 +313,9 @@ rpc.exports = {
     return Memory.readByteArray(ptr(address), size);
   }
 };
-""")
+"""
+
+script = session.create_script(agent_source)
 script.on("message", on_message)
 script.load()
 
